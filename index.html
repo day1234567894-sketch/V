@@ -498,7 +498,6 @@ body.guest-mode .admin-only { display: none !important; }
 .sale-cart-summary { font-family: sans-serif; font-size: 13px; color: var(--text-mid); margin: 4px 0 10px; text-align: right; font-weight: 700; }
 .sale-cart-summary strong { color: var(--maroon); font-size: 15px; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -1533,7 +1532,7 @@ function applyCompanyInfo() {
 // ===== PASSWORD SECURITY =====
 // The admin password is never stored as plain text — only its SHA-256 hash
 // is kept in DB.company.adminPassword. This means the password itself is not
-// visible if someone opens the browser's dev tools, inspects the database, or
+// visible if someone opens the browser's dev tools, inspects IndexedDB, or
 // reads an exported backup JSON file. (Customer passkeys are left as plain
 // text on purpose — they're meant to be shared with customers and shown
 // back to the admin in the Customers list, so they work more like an
@@ -1781,72 +1780,67 @@ document.addEventListener('DOMContentLoaded', function() {
 // Every category automatically gets a 'price' field (number) — not stored in fields array, handled specially.
 let DB = { products: [], sales: [], categories: [], customers: [] };
 
-// ===== STORAGE ENGINE: Supabase (cloud) =====
-// All app data lives as a single JSON document in the `app_data` table so the
-// entire rest of the app (which reads/writes the in-memory DB object and just
-// calls save()) doesn't need to change. A tiny localStorage cache is kept
-// purely so the app can still show the last-synced data if the device goes
-// offline — Supabase remains the source of truth.
-const SUPABASE_URL = 'https://irzlzpdexusrukbyeppx.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_qNVUWknhXtB8lWsBisiDiw_bUA8-lGT';
-const SUPABASE_ROW_ID = 'main';
-const LOCAL_CACHE_KEY = 'pf_db_cache';
-const sb = (window.supabase) ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
-
-let idbUsable = true; // reused as "cloud sync is currently working" flag for the storage warning banner
-let lastSyncedAt = null; // updated_at of the version we last wrote/read, used to ignore our own realtime echoes
-let applyingRemoteUpdate = false;
-
-function cacheLocally() {
-  try { localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(DB)); } catch(e) {}
+// ===== STORAGE ENGINE: IndexedDB (holds far more than localStorage's ~5-10MB —
+// needed once you have hundreds of designs with photos). Falls back to
+// localStorage only if IndexedDB is unavailable, and auto-migrates any old
+// localStorage data the first time it runs. =====
+const IDB_DB_NAME = 'pf_store', IDB_STORE = 'kv', IDB_KEY = 'pf_db';
+let idbUsable = true;
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) { reject(new Error('no-indexeddb')); return; }
+    const req = indexedDB.open(IDB_DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGet(key) {
+  return openIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const rq = tx.objectStore(IDB_STORE).get(key);
+    rq.onsuccess = () => resolve(rq.result);
+    rq.onerror = () => reject(rq.error);
+  }));
+}
+function idbSet(key, val) {
+  return openIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(val, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  }));
 }
 
-let saveTimer = null;
 function save() {
-  cacheLocally(); // instant local cache so nothing is lost even if the network call is still pending
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(doCloudSave, 350);
+  idbSet(IDB_KEY, DB).catch(() => {
+    idbUsable = false;
+    try { localStorage.setItem('pf_db3', JSON.stringify(DB)); }
+    catch(e) { toast('⚠ Storage error — could not save! Please Backup Data now.'); }
+  });
   return true;
 }
 
-async function doCloudSave() {
-  if (!sb) { idbUsable = false; return; }
-  try {
-    const nowIso = new Date().toISOString();
-    const { error } = await sb.from('app_data').upsert({ id: SUPABASE_ROW_ID, data: DB, updated_at: nowIso });
-    if (error) throw error;
-    lastSyncedAt = nowIso;
-    idbUsable = true;
-  } catch (e) {
-    console.error('Supabase save failed', e);
-    idbUsable = false;
-    toast('⚠ Could not sync to cloud — changes saved on this device only for now');
-  }
-}
-
 async function load() {
-  if (!sb) { idbUsable = false; loadFromLocalCacheOnly(); }
-  else {
-    try {
-      const { data, error } = await sb.from('app_data').select('data, updated_at').eq('id', SUPABASE_ROW_ID).maybeSingle();
-      if (error) throw error;
-      if (data && data.data) {
-        DB = data.data;
-        lastSyncedAt = data.updated_at;
-        cacheLocally();
-      } else {
-        // No row yet in Supabase — first run for this project. Use any local
-        // cache (or defaults) and let the upcoming save() create the row.
-        loadFromLocalCacheOnly();
+  try {
+    let data = await idbGet(IDB_KEY);
+    if (!data) {
+      // First run on this device, or migrating from the old localStorage engine
+      const raw = localStorage.getItem('pf_db3');
+      if (raw) {
+        try {
+          data = JSON.parse(raw);
+          await idbSet(IDB_KEY, data);
+        } catch(e) {}
       }
-      idbUsable = true;
-      subscribeToRemoteChanges();
-    } catch (e) {
-      console.error('Supabase load failed', e);
-      idbUsable = false;
-      loadFromLocalCacheOnly();
-      toast('⚠ Offline — showing last synced data');
     }
+    if (data) DB = data;
+  } catch(e) {
+    idbUsable = false;
+    try {
+      const raw = localStorage.getItem('pf_db3');
+      if (raw) DB = JSON.parse(raw);
+    } catch(e2) { toast('⚠ Could not load saved data'); }
   }
   if (!DB.categories) DB.categories = [];
   if (!DB.products) DB.products = [];
@@ -1874,38 +1868,6 @@ async function load() {
     DB.company.adminPassword = await sha256Hex(DB.company.adminPassword);
     save();
   }
-}
-
-function loadFromLocalCacheOnly() {
-  try {
-    const raw = localStorage.getItem(LOCAL_CACHE_KEY);
-    if (raw) DB = JSON.parse(raw);
-  } catch(e) {}
-}
-
-// Live sync: when another device/tab writes to app_data, pick up the change
-// here automatically instead of requiring a manual refresh.
-let realtimeSubscribed = false;
-function subscribeToRemoteChanges() {
-  if (!sb || realtimeSubscribed) return;
-  realtimeSubscribed = true;
-  sb.channel('app_data_changes')
-    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'app_data', filter: `id=eq.${SUPABASE_ROW_ID}` }, (payload) => {
-      const incoming = payload.new;
-      if (!incoming || !incoming.data) return;
-      if (incoming.updated_at === lastSyncedAt) return; // our own write echoing back
-      // Avoid yanking the DB out from under someone mid-edit in a modal.
-      const modalOpen = document.querySelector('.modal-overlay.open');
-      if (modalOpen) return;
-      applyingRemoteUpdate = true;
-      DB = incoming.data;
-      lastSyncedAt = incoming.updated_at;
-      cacheLocally();
-      if (typeof renderCatalogue === 'function' && currentView === 'catalogue') renderCatalogue();
-      if (typeof renderSalesReport === 'function' && currentView === 'sales') renderSalesReport();
-      applyingRemoteUpdate = false;
-    })
-    .subscribe();
 }
 
 let editingImages = [], colorTags = [], productTags = [], selectedCategory = null, editingId = null, addQtyTargetId = null;
@@ -5274,14 +5236,14 @@ function importBackup(input) {
 function showStorageWarning() {
   const banner = document.createElement('div');
   banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:#c0392b;color:white;font-family:sans-serif;font-size:12px;padding:10px 14px;text-align:center;line-height:1.5';
-  banner.innerHTML = '⚠ Not connected to the cloud right now — changes are only saved on this device.<br>Check your internet connection, or use Backup &amp; Restore to preserve your data.<br><button onclick="this.parentElement.remove()" style="background:rgba(255,255,255,0.2);border:none;color:white;padding:3px 10px;border-radius:10px;margin-top:4px;cursor:pointer">Dismiss</button>';
+  banner.innerHTML = '⚠ Data cannot be saved reliably in this browser session.<br>Open as a regular tab (not incognito/private) or use Backup &amp; Restore to preserve your data.<br><button onclick="this.parentElement.remove()" style="background:rgba(255,255,255,0.2);border:none;color:white;padding:3px 10px;border-radius:10px;margin-top:4px;cursor:pointer">Dismiss</button>';
   document.body.appendChild(banner);
 }
 
 (async function initApp() {
   applyI18n();
   await load();
-migrateData(); // DB was just loaded from Supabase (falls back to local cache if offline)
+migrateData(); // reads from IndexedDB (falls back to/migrates old localStorage data)
   applyCompanyInfo();
   console.log('Pratap Fashion catalogue build: 2026-07-05-multi-item-sale-cart');
   if (!idbUsable) showStorageWarning();
