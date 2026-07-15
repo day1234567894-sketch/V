@@ -173,6 +173,29 @@ body { font-family: 'Georgia', serif; background: var(--cream); color: var(--tex
 .filter-price-row input { flex: 1; }
 .filter-panel-actions { display: flex; gap: 8px; }
 
+/* BULK SELECT MODE */
+.product-card.select-mode { cursor: pointer; }
+.card-select-check {
+  position: absolute; top: 8px; left: 8px; z-index: 5;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: rgba(255,255,255,0.9); border: 2px solid var(--maroon);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; color: transparent; transition: all 0.15s;
+}
+.product-card.selected .card-select-check { background: var(--maroon); color: var(--gold-light); }
+.product-card.selected { outline: 2.5px solid var(--maroon); outline-offset: -2.5px; border-radius: var(--radius); }
+.bulk-action-bar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+  background: var(--maroon-dark); border-top: 2px solid var(--gold);
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  display: none; align-items: center; gap: 8px;
+  box-shadow: 0 -4px 20px rgba(0,0,0,0.3);
+}
+.bulk-action-bar.open { display: flex; }
+.bulk-action-count { color: var(--gold-light); font-family: sans-serif; font-size: 12px; font-weight: 700; flex-shrink: 0; margin-right: 2px; }
+.bulk-action-bar .btn { padding: 8px 12px; font-size: 11px; }
+.bulk-action-spacer { flex: 1; }
+
 /* PRODUCT GRID */
 .product-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; padding: 0 12px; }
 .pagination-bar { display: flex; align-items: center; justify-content: center; gap: 12px; margin: 16px 12px 4px; flex-wrap: wrap; }
@@ -353,6 +376,11 @@ body { font-family: 'Georgia', serif; background: var(--cream); color: var(--tex
 .color-tag .remove { background: none; border: none; color: var(--text-light); cursor: pointer; font-size: 14px; padding: 0 0 0 3px; line-height: 1; }
 .color-add-row { display: flex; gap: 7px; align-items: center; }
 .color-add-row input[type="color"] { width: 38px; height: 34px; padding: 2px; border: 1.5px solid var(--cream-dark); border-radius: var(--radius-sm); cursor: pointer; background: var(--white); }
+.existing-colors-label { font-family: sans-serif; font-size: 10px; color: var(--text-light); margin-bottom: 5px; }
+.existing-colors-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
+.existing-color-chip { display: flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 14px; background: var(--white); border: 1px solid var(--border); font-size: 11px; font-family: sans-serif; cursor: pointer; color: var(--text-mid); transition: all 0.15s; }
+.existing-color-chip:active { transform: scale(0.96); background: var(--cream-dark); }
+.existing-color-chip .swatch { width: 13px; height: 13px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.18); flex-shrink: 0; }
 
 /* TOAST */
 .toast { position: fixed; bottom: 88px; left: 50%; transform: translateX(-50%); background: var(--maroon-dark); color: var(--gold-light); padding: 9px 20px; border-radius: 22px; font-size: 13px; font-family: sans-serif; box-shadow: var(--shadow); z-index: 300; opacity: 0; transition: opacity 0.3s; pointer-events: none; white-space: nowrap; border: 1px solid var(--gold); max-width: 90vw; overflow: hidden; text-overflow: ellipsis; }
@@ -644,6 +672,7 @@ body.guest-mode .admin-only { display: none !important; }
 
     <div class="filter-row-with-menu">
       <div class="filter-bar" id="filterBar"></div>
+      <button class="hamburger-btn admin-only" id="selectModeBtn" onclick="toggleSelectMode()" title="Select multiple">☑</button>
       <button class="hamburger-btn" id="hamburgerBtn" onclick="toggleCombinedFilterPanel()">☰</button>
     </div>
 
@@ -681,6 +710,15 @@ body.guest-mode .admin-only { display: none !important; }
 
     <div class="product-grid" id="productGrid"></div>
     <div class="pagination-bar" id="paginationBar"></div>
+
+    <div class="bulk-action-bar" id="bulkActionBar">
+      <span class="bulk-action-count" id="bulkActionCount">0 selected</span>
+      <div class="bulk-action-spacer"></div>
+      <button class="btn btn-outline btn-sm" onclick="bulkShareSelected()">🔗 Share</button>
+      <button class="btn btn-outline btn-sm" onclick="bulkArchiveSelected()">📦 Archive</button>
+      <button class="btn btn-danger btn-sm" onclick="bulkDeleteSelected()">🗑 Delete</button>
+      <button class="btn btn-outline btn-sm" onclick="toggleSelectMode()">Cancel</button>
+    </div>
     <div class="empty-state" id="emptyState" style="display:none">
       <div class="icon">🏮</div>
       <p data-i18n="empty_no_items">No items found. Tap + to add your first item.</p>
@@ -754,6 +792,7 @@ body.guest-mode .admin-only { display: none !important; }
       <div class="form-section">
         <div class="form-section-title" data-i18n="sec_colours">🎨 Available Colours</div>
         <div class="color-tags" id="colorTagsContainer"></div>
+        <div id="existingColorsRow"></div>
         <div class="color-add-row">
           <input type="color" id="colorPicker" value="#8B2E2E">
           <input class="form-input" id="colorName" placeholder="Colour name e.g. Royal Red" data-i18n-ph="ph_colour_name" style="flex:1">
@@ -1746,6 +1785,7 @@ async function unlockApp() {
     document.getElementById('appGate').classList.add('hidden');
     document.getElementById('gateErr').textContent = '';
     applyRoleUI();
+    checkBackupReminder();
   } else {
     document.getElementById('gateErr').textContent = '✕ Incorrect password';
   }
@@ -1784,7 +1824,9 @@ let DB = { products: [], sales: [], categories: [], customers: [] };
 // needed once you have hundreds of designs with photos). Falls back to
 // localStorage only if IndexedDB is unavailable, and auto-migrates any old
 // localStorage data the first time it runs. =====
-const IDB_DB_NAME = 'pf_store', IDB_STORE = 'kv', IDB_KEY = 'pf_db';
+const IDB_DB_NAME = 'pf_store', IDB_STORE = 'kv', IDB_KEY = 'pf_db', IDB_BACKUP_KEY = 'pf_last_backup_at';
+let lastBackupAt = null;
+const BACKUP_REMINDER_DAYS = 3;
 let idbUsable = true;
 function openIDB() {
   return new Promise((resolve, reject) => {
@@ -1871,6 +1913,7 @@ async function load() {
 }
 
 let editingImages = [], colorTags = [], productTags = [], selectedCategory = null, editingId = null, addQtyTargetId = null;
+let selectMode = false, selectedProductIds = new Set();
 let ncFieldDefs = []; // temp field defs while building a new category
 let activeCategory = 'all';
 let openFilterPanelName = null;
@@ -1902,6 +1945,11 @@ function requestAccess(action, payload) {
 let currentView = 'catalogue';
 function switchView(id) {
   if (id !== 'catalogue' && userRole !== 'admin') { toast(t('toast_admin_required_login')); id = 'catalogue'; }
+  if (id !== 'catalogue' && selectMode) {
+    selectMode = false; selectedProductIds.clear();
+    document.getElementById('selectModeBtn')?.classList.remove('has-active');
+    updateBulkActionBar();
+  }
   currentView = id;
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   document.getElementById('view-' + id).classList.add('active');
@@ -3516,8 +3564,13 @@ function renderCatalogue(search = '') {
       ? `<div style="margin-top:5px"><span style="background:#c0392b;color:#fff;font-family:sans-serif;font-size:9px;padding:2px 8px;border-radius:10px;font-weight:700">🙈 Hidden from customers</span></div>`
       : '';
 
-    return `<div class="product-card" onclick="openDetail('${p.id}')">
-      <div class="card-img-wrap">${imgHtml}${tagsOverlayHtml}</div>
+    const isSelected = selectedProductIds.has(p.id);
+    const cardClasses = 'product-card' + (selectMode ? ' select-mode' : '') + (isSelected ? ' selected' : '');
+    const cardClickAttr = selectMode ? `toggleProductSelect('${p.id}')` : `openDetail('${p.id}')`;
+    const selectCheckHtml = selectMode ? `<div class="card-select-check">✓</div>` : '';
+
+    return `<div class="${cardClasses}" onclick="${cardClickAttr}">
+      <div class="card-img-wrap">${selectCheckHtml}${imgHtml}${tagsOverlayHtml}</div>
       <div class="card-body">
         <div class="card-design-no">${p.design}</div>
         <div class="card-item-name">${p.name||p.category||'—'}</div>
@@ -3846,6 +3899,109 @@ async function shareProduct(id) {
   }
 }
 
+// ===== BULK SELECT MODE (multi-select share / archive / delete) =====
+function toggleSelectMode() {
+  if (userRole !== 'admin') return;
+  selectMode = !selectMode;
+  selectedProductIds.clear();
+  document.getElementById('selectModeBtn')?.classList.toggle('has-active', selectMode);
+  updateBulkActionBar();
+  renderCatalogue(document.getElementById('searchInput')?.value.trim() || '');
+}
+function toggleProductSelect(id) {
+  if (selectedProductIds.has(id)) selectedProductIds.delete(id);
+  else selectedProductIds.add(id);
+  updateBulkActionBar();
+  renderCatalogue(document.getElementById('searchInput')?.value.trim() || '');
+}
+function updateBulkActionBar() {
+  const bar = document.getElementById('bulkActionBar');
+  if (!bar) return;
+  bar.classList.toggle('open', selectMode && selectedProductIds.size > 0);
+  document.getElementById('bulkActionCount').textContent = selectedProductIds.size + ' selected';
+}
+
+function bulkArchiveSelected() {
+  const ids = [...selectedProductIds];
+  if (!ids.length) return;
+  ids.forEach(id => {
+    const p = DB.products.find(x => x.id === id);
+    if (p && !p.archived) { p.archived = true; p.archivedAt = Date.now(); }
+  });
+  save();
+  toast('📦 ' + ids.length + ' item(s) archived');
+  toggleSelectMode();
+}
+
+function bulkDeleteSelected() {
+  const ids = [...selectedProductIds];
+  if (!ids.length) return;
+  const ov = document.createElement('div');
+  ov.className = 'modal-overlay open';
+  ov.style.zIndex = 400;
+  ov.innerHTML = `<div class="modal" style="max-width:360px">
+    <div class="modal-header">
+      <div class="modal-title">⚠ Confirm Delete</div>
+      <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-family:sans-serif;font-size:14px;color:var(--text-dark);margin-bottom:16px">
+        Are you sure you want to permanently delete <strong>${ids.length} item(s)</strong>? This cannot be undone.
+      </p>
+      <div style="display:flex;gap:9px">
+        <button class="btn btn-outline" style="flex:1;justify-content:center" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+        <button class="btn btn-danger" style="flex:1;justify-content:center" onclick="confirmBulkDelete();this.closest('.modal-overlay').remove()">${t('btn_delete')}</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+}
+function confirmBulkDelete() {
+  const ids = new Set(selectedProductIds);
+  DB.products = DB.products.filter(p => !ids.has(p.id));
+  save();
+  toast('✓ ' + ids.size + ' item(s) deleted');
+  toggleSelectMode();
+}
+
+// Shares the selected products' cover images together, with no caption/text —
+// just the images, since a single shared caption doesn't make sense across
+// multiple different products.
+async function bulkShareSelected() {
+  const ids = [...selectedProductIds];
+  if (!ids.length) return;
+  const products = ids.map(id => DB.products.find(p => p.id === id)).filter(p => p && p.images && p.images.length);
+  if (!products.length) { toast('⚠ Selected item(s) have no photos to share'); return; }
+
+  try {
+    if (!navigator.canShare) throw new Error('no-share-api');
+    const files = [];
+    for (const p of products) {
+      const res = await fetch(p.images[0]);
+      const blob = await res.blob();
+      const ext = blob.type.split('/')[1] || 'jpg';
+      files.push(new File([blob], p.design + '.' + ext, { type: blob.type }));
+    }
+    if (!navigator.canShare({ files })) throw new Error('cannot-share-files');
+    await navigator.share({ files });
+    toggleSelectMode();
+    return;
+  } catch (e) {
+    if (e && e.name === 'AbortError') return; // user cancelled share sheet
+    // Fallback: download each selected image individually (no caption/text involved)
+    products.forEach((p, i) => {
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = p.images[0];
+        a.download = p.design + '.jpg';
+        document.body.appendChild(a); a.click(); a.remove();
+      }, i * 300);
+    });
+    toast('✓ Downloading ' + products.length + ' image(s)');
+    toggleSelectMode();
+  }
+}
+
 function openFullImg(src) {
   const ov = document.createElement('div');
   ov.className = 'zoom-overlay';
@@ -4032,16 +4188,49 @@ function addColorTag() {
   const hex = document.getElementById('colorPicker').value;
   const name = document.getElementById('colorName').value.trim();
   if (!name) { toast('Enter a colour name'); return; }
+  if (colorTags.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+    toast('⚠ This colour is already added to this item');
+    return;
+  }
   colorTags.push({ hex, name });
   document.getElementById('colorName').value = '';
   renderColorTags();
+  renderExistingColorPicker();
 }
 function renderColorTags() {
   document.getElementById('colorTagsContainer').innerHTML = colorTags.map((c,i) =>
     `<div class="color-tag"><div class="swatch" style="background:${c.hex}"></div><span>${c.name}</span><button class="remove" onclick="removeColor(${i})">×</button></div>`
   ).join('');
 }
-function removeColor(i) { colorTags.splice(i,1); renderColorTags(); }
+function removeColor(i) { colorTags.splice(i,1); renderColorTags(); renderExistingColorPicker(); }
+
+// Quick-pick list of colours already used on other products, so the same
+// colour doesn't get re-created (with a slightly different shade/hue) via
+// the hue/saturation picker every time. Tapping a chip reuses that exact
+// name+hex instead of dragging the picker again.
+function renderExistingColorPicker() {
+  const container = document.getElementById('existingColorsRow');
+  if (!container) return;
+  const allColors = new Map();
+  DB.products.forEach(p => (p.colors||[]).forEach(c => {
+    const key = c.name.toLowerCase();
+    if (!allColors.has(key)) allColors.set(key, c);
+  }));
+  const usedNames = new Set(colorTags.map(c => c.name.toLowerCase()));
+  const available = [...allColors.values()].filter(c => !usedNames.has(c.name.toLowerCase()));
+  if (!available.length) { container.innerHTML = ''; return; }
+  container.innerHTML = '<div class="existing-colors-label">Tap to reuse an existing colour</div><div class="existing-colors-row">' +
+    available.map(c =>
+      `<div class="existing-color-chip" onclick="quickAddColor('${c.name.replace(/'/g,"\\'")}', '${c.hex}')"><div class="swatch" style="background:${c.hex}"></div><span>${c.name}</span></div>`
+    ).join('') +
+  '</div>';
+}
+function quickAddColor(name, hex) {
+  if (colorTags.some(c => c.name.toLowerCase() === name.toLowerCase())) { toast('Colour already added'); return; }
+  colorTags.push({ hex, name });
+  renderColorTags();
+  renderExistingColorPicker();
+}
 
 // ===== PRODUCT TAGS =====
 function addTag() {
@@ -4065,6 +4254,13 @@ function saveProduct() {
   const design = document.getElementById('f_design').value.trim();
   if (!design) { toast('Design No. is required'); return; }
   if (!selectedCategory) { toast('Please select a category'); return; }
+
+  const designKey = design.toLowerCase();
+  const clashingActive = DB.products.find(p => p.id !== editingId && (p.design||'').trim().toLowerCase() === designKey);
+  if (clashingActive) {
+    toast('⚠ Design No. "' + design + '" is already used by "' + (clashingActive.name || clashingActive.design) + '"');
+    return;
+  }
 
   const cat = getCategoryDef(selectedCategory);
   const customFields = {};
@@ -4169,7 +4365,7 @@ function clearForm() {
   document.getElementById('f_alert').value = 5;
   document.getElementById('f_hidden').checked = false;
   editingImages = []; colorTags = []; productTags = []; editingId = null; selectedCategory = null;
-  renderImgPreviews(); renderColorTags(); renderProductTags(); renderCatSelectGrid();
+  renderImgPreviews(); renderColorTags(); renderExistingColorPicker(); renderProductTags(); renderCatSelectGrid();
   document.getElementById('dynamicFieldsSection').style.display = 'none';
   toggleStockFieldsUI();
 }
@@ -4194,7 +4390,7 @@ function editProduct(id) {
     colorTags = [...(p.colors||[])];
     productTags = [...(p.tags||[])];
     document.getElementById('f_hidden').checked = !!p.hiddenFromGuests;
-    renderImgPreviews(); renderColorTags(); renderProductTags();
+    renderImgPreviews(); renderColorTags(); renderExistingColorPicker(); renderProductTags();
     selectedCategory = p.category;
     renderCatSelectGrid();
     renderDynamicFields();
@@ -4468,8 +4664,12 @@ function saveBulkRows() {
     return { cost, retailPct, wholesalePct, price: calcRate(cost, retailPct), wholesalePrice: calcRate(cost, wholesalePct) };
   }
 
+  let skipped = [];
   bulkRows.forEach(r => {
     if (!r.design || !r.design.trim()) return;
+    const designKey = r.design.trim().toLowerCase();
+    const clash = DB.products.some(p => (p.design||'').trim().toLowerCase() === designKey);
+    if (clash) { skipped.push(r.design.trim()); return; }
     let price, wholesalePrice, cost, retailPct, wholesalePct, priceMax, stock, alertAt, parts = {};
 
     if (isSet) {
@@ -4524,9 +4724,12 @@ function saveBulkRows() {
     saved++;
   });
 
-  if (!saved) { toast('⚠ Enter at least one Design No.'); return; }
+  if (!saved) {
+    toast(skipped.length ? '⚠ All design numbers already in use: ' + skipped.join(', ') : '⚠ Enter at least one Design No.');
+    return;
+  }
   save();
-  toast('✓ ' + saved + ' item(s) added to ' + catName);
+  toast('✓ ' + saved + ' item(s) added to ' + catName + (skipped.length ? ' — skipped duplicate(s): ' + skipped.join(', ') : ''));
   bulkRows = [];
   document.getElementById('bulk_category').value = '';
   renderBulkTable();
@@ -4610,7 +4813,7 @@ function renderArchivedList(search = '') {
 
   container.innerHTML = items.map(p => {
     const thumb = (p.images && p.images[0])
-      ? `<img src="${p.images[0]}" style="width:52px;height:52px;object-fit:cover;border-radius:8px;flex-shrink:0">`
+      ? `<img src="${p.images[0]}" loading="lazy" style="width:52px;height:52px;object-fit:cover;border-radius:8px;flex-shrink:0">`
       : `<div style="width:52px;height:52px;border-radius:8px;background:var(--cream-dark);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🏮</div>`;
     const when = p.archivedAt ? new Date(p.archivedAt).toLocaleDateString('en-IN', {day:'2-digit',month:'short',year:'numeric'}) : '';
     return `<div class="report-row" style="align-items:center">
@@ -5198,6 +5401,9 @@ function exportBackup() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+  lastBackupAt = Date.now();
+  idbSet(IDB_BACKUP_KEY, lastBackupAt).catch(() => {});
+  document.getElementById('backupReminderBanner')?.remove();
   toast('✓ Backup downloaded');
 }
 
@@ -5240,6 +5446,32 @@ function showStorageWarning() {
   document.body.appendChild(banner);
 }
 
+// ===== BACKUP REMINDER (nudges admin to back up data every few days) =====
+async function checkBackupReminder() {
+  if (userRole !== 'admin') return;
+  if (document.getElementById('backupReminderBanner')) return; // already showing
+  if (lastBackupAt === null) {
+    try { lastBackupAt = await idbGet(IDB_BACKUP_KEY); } catch(e) { lastBackupAt = null; }
+  }
+  const daysMs = BACKUP_REMINDER_DAYS * 24 * 60 * 60 * 1000;
+  const overdue = !lastBackupAt || (Date.now() - lastBackupAt) >= daysMs;
+  if (overdue) showBackupReminderBanner();
+}
+function showBackupReminderBanner() {
+  if (document.getElementById('backupReminderBanner')) return;
+  const daysSince = lastBackupAt ? Math.floor((Date.now() - lastBackupAt) / 86400000) : null;
+  const msg = lastBackupAt
+    ? `⚠ It's been ${daysSince} day(s) since your last backup.`
+    : `⚠ You haven't backed up your data yet.`;
+  const banner = document.createElement('div');
+  banner.id = 'backupReminderBanner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:998;background:linear-gradient(135deg,var(--maroon-dark),var(--maroon));color:var(--gold-light);font-family:sans-serif;font-size:12px;padding:10px 14px;text-align:center;line-height:1.5;border-bottom:2px solid var(--gold)';
+  banner.innerHTML = msg + ' Please back up your data regularly.<br>' +
+    '<button onclick="exportBackup();document.getElementById(\'backupReminderBanner\')?.remove()" style="background:var(--gold);border:none;color:var(--maroon-dark);font-weight:700;padding:4px 12px;border-radius:12px;margin-top:6px;margin-right:6px;cursor:pointer">⬇ Backup Now</button>' +
+    '<button onclick="this.parentElement.remove()" style="background:rgba(255,255,255,0.15);border:none;color:var(--gold-light);padding:4px 12px;border-radius:12px;margin-top:6px;cursor:pointer">Remind Me Later</button>';
+  document.body.appendChild(banner);
+}
+
 (async function initApp() {
   applyI18n();
   await load();
@@ -5263,6 +5495,7 @@ migrateData(); // reads from IndexedDB (falls back to/migrates old localStorage 
   updateStockFilterUI();
   renderCatalogue();
   applyRoleUI();
+  checkBackupReminder();
 })();
 
 // ===== PWA: INSTALL PROMPT + SERVICE WORKER =====
