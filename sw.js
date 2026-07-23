@@ -1,5 +1,5 @@
 // Bump this whenever you re-deploy so old caches get cleared out.
-const CACHE_VERSION = 'pratap-fashion-v1';
+const CACHE_VERSION = 'pratap-fashion-v2';
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -34,7 +34,7 @@ self.addEventListener('fetch', (event) => {
 
   if (isHtml) {
     event.respondWith(
-      fetch(event.request)
+      fetch(event.request, { cache: 'no-store' })
         .then((res) => {
           const copy = res.clone();
           caches.open(CACHE_VERSION).then((cache) => cache.put(event.request, copy));
