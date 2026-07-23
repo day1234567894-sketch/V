@@ -667,6 +667,13 @@ body.guest-mode .admin-only { display: none !important; }
       </label>
     </div>
     <div class="admin-only" style="display:flex;gap:8px;padding:0 12px;margin-bottom:10px">
+      <button class="btn btn-outline btn-sm" style="flex:1;justify-content:center" onclick="requestAccess(exportPhotos)">⬇ Export Photos (full quality)</button>
+      <label class="btn btn-outline btn-sm" style="flex:1;justify-content:center;position:relative;overflow:hidden;cursor:pointer">
+        ⬆ Restore Photos
+        <input type="file" accept=".zip,application/zip" id="restorePhotosInput" onchange="handleImportPhotosClick(this)" style="position:absolute;inset:0;opacity:0;cursor:pointer">
+      </label>
+    </div>
+    <div class="admin-only" style="display:flex;gap:8px;padding:0 12px;margin-bottom:10px">
       <button class="btn btn-primary btn-sm" id="installAppBtn" style="flex:1;justify-content:center;display:none" onclick="installApp()"><span data-i18n="btn_install_app">📲 Install App on this Device</span></button>
     </div>
 
@@ -1853,6 +1860,48 @@ function idbSet(key, val) {
     tx.onerror = () => reject(tx.error);
   }));
 }
+function idbDelete(key) {
+  return openIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+// ===== FULL-QUALITY PHOTO STORAGE =====
+// Full-resolution photos are stored individually in IndexedDB, one per key,
+// completely separate from the main product database (DB). A product only
+// holds a short reference id (e.g. "img_172xxx_ab12c") in its `images` array
+// — never the actual multi-MB photo. This means:
+//   - The main DB stays small and fast to save/load no matter how many
+//     products or photos you have (500 products' worth of metadata + small
+//     thumbnails is only a few MB, vs. gigabytes if full photos were embedded).
+//   - A photo's full quality is only loaded into memory when you actually
+//     open that specific product — not all of them at once.
+// Photos are still stored at their original, untouched quality — nothing
+// about the photo itself is changed, only *where* it lives.
+const IMG_KEY_PREFIX = 'img_';
+function newImageId() { return IMG_KEY_PREFIX + Date.now() + '_' + Math.random().toString(36).slice(2, 9); }
+function isImageId(v) { return typeof v === 'string' && v.startsWith(IMG_KEY_PREFIX); }
+function isDataUrl(v) { return typeof v === 'string' && v.startsWith('data:'); }
+function idbSetImage(id, dataUrl) { return idbSet(id, dataUrl); }
+function idbGetImage(id) { return idbGet(id).catch(() => null); }
+function idbDeleteImage(id) { return idbDelete(id).catch(() => {}); }
+// Resolves a stored image reference (either a legacy inline data URL, or a
+// new-style id pointing at a separately-stored full-quality photo) to an
+// actual data URL ready to display, share, print, or download.
+async function resolveFullImage(ref) {
+  if (!ref) return null;
+  if (isDataUrl(ref)) return ref; // legacy: already the full image itself
+  if (isImageId(ref)) {
+    try { return await idbGetImage(ref); } catch (e) { return null; }
+  }
+  return ref;
+}
+function deleteProductImages(p) {
+  (p && p.images || []).forEach(ref => { if (isImageId(ref)) idbDeleteImage(ref); });
+}
 
 function save() {
   idbSet(IDB_KEY, DB).catch(() => {
@@ -1913,6 +1962,7 @@ async function load() {
 }
 
 let editingImages = [], colorTags = [], productTags = [], selectedCategory = null, editingId = null, addQtyTargetId = null;
+let imagesPendingDeleteOnSave = []; // existing stored image ids removed during this edit session — only actually deleted from storage if the edit is saved
 let selectMode = false, selectedProductIds = new Set();
 let ncFieldDefs = []; // temp field defs while building a new category
 let activeCategory = 'all';
@@ -3191,6 +3241,18 @@ function loadJsPDF() {
   });
 }
 
+let jsZipLoaded = false;
+function loadJSZip() {
+  return new Promise((resolve, reject) => {
+    if (window.JSZip) { jsZipLoaded = true; resolve(); return; }
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    script.onload = () => { jsZipLoaded = true; resolve(); };
+    script.onerror = () => reject(new Error('Could not load ZIP library — check internet connection'));
+    document.head.appendChild(script);
+  });
+}
+
 function loadImageAsDataUrl(src) {
   return new Promise((resolve) => {
     if (src.startsWith('data:')) { resolve(src); return; }
@@ -3283,7 +3345,7 @@ async function generateImagesPDF() {
   let pageCount = 0;
   for (let i = 0; i < products.length; i++) {
     const p = products[i];
-    const dataUrl = await loadImageAsDataUrl(p.images[0]);
+    const dataUrl = await resolveFullImage(p.images[0]);
     if (!dataUrl) continue;
 
     if (pageCount > 0) doc.addPage();
@@ -3492,8 +3554,9 @@ function renderCatalogue(search = '') {
     const qtyLabel = (isOut && canSeeAlert) ? t('lbl_out') : (st.isSet ? st.available + ' ' + t('unit_sets') : st.available + ' ' + t('unit_pcs'));
     const dotHtml = (canSeeAlert && (isLow || isOut)) ? '<span class="stock-dot"></span>' : '';
 
-    const imgHtml = p.images && p.images.length
-      ? `<img src="${p.images[0]}" alt="${p.design}" loading="lazy">`
+    const cardImgSrc = (p.thumbs && p.thumbs[0]) || (isDataUrl(p.images && p.images[0]) ? p.images[0] : null);
+    const imgHtml = cardImgSrc
+      ? `<img src="${cardImgSrc}" alt="${p.design}" loading="lazy">`
       : `<div class="card-img-placeholder">🏮<span>${p.category||'Item'}</span></div>`;
 
     const fmtRangeStr = (range, single) => {
@@ -3618,9 +3681,13 @@ function openDetail(id) {
 
   let imgHtml = '';
   if (p.images && p.images.length === 1) {
-    imgHtml = `<img class="detail-img-single" src="${p.images[0]}" onclick="openFullImg(this.src)" alt="Tap to zoom">`;
+    const previewSrc = (p.thumbs && p.thumbs[0]) || (isDataUrl(p.images[0]) ? p.images[0] : '');
+    imgHtml = `<img class="detail-img-single" src="${previewSrc}" data-full-ref="${p.images[0]}" onclick="openFullImgFor(this.dataset.fullRef)" alt="Tap to zoom">`;
   } else if (p.images && p.images.length > 1) {
-    imgHtml = `<div class="detail-imgs">${p.images.map(src => `<img class="detail-img-item" src="${src}" onclick="openFullImg(this.src)" alt="Tap to zoom">`).join('')}</div>`;
+    imgHtml = `<div class="detail-imgs">${p.images.map((ref,i) => {
+      const previewSrc = (p.thumbs && p.thumbs[i]) || (isDataUrl(ref) ? ref : '');
+      return `<img class="detail-img-item" src="${previewSrc}" data-full-ref="${ref}" onclick="openFullImgFor(this.dataset.fullRef)" alt="Tap to zoom">`;
+    }).join('')}</div>`;
   } else {
     imgHtml = `<div class="detail-img-placeholder">🏮</div>`;
   }
@@ -3806,6 +3873,28 @@ function openDetail(id) {
   `;
   updateDetailNavButtons(id);
   openModal('detailModal');
+  upgradeDetailImages();
+}
+
+// Once the detail modal is showing the lightweight thumbnail, quietly fetch
+// the actual full-quality photo(s) from storage and swap them in. Keeps the
+// modal opening instantly instead of waiting on a storage read first.
+function upgradeDetailImages() {
+  const body = document.getElementById('detailBody');
+  if (!body) return;
+  body.querySelectorAll('img[data-full-ref]').forEach(img => {
+    const ref = img.dataset.fullRef;
+    if (isDataUrl(ref)) { if (!img.src || img.src === 'about:blank') img.src = ref; return; }
+    resolveFullImage(ref).then(full => { if (full) img.src = full; });
+  });
+}
+
+// Opens the zoom viewer for a detail-image reference, resolving it to full
+// quality first (works whether the ref is already a data URL or a stored id).
+async function openFullImgFor(ref) {
+  const src = await resolveFullImage(ref);
+  if (src) openFullImg(src);
+  else toast('⚠ Could not load photo');
 }
 
 // ===== DETAIL PREV/NEXT NAVIGATION =====
@@ -3870,8 +3959,9 @@ async function shareProduct(id) {
   const text = `${p.design} — ${p.name||p.category}\n${priceStr}\n${DB.company.name}, ${DB.company.city}\n${DB.company.managerName}: ${DB.company.managerPhone}`;
 
   try {
-    if (p.images && p.images.length && navigator.canShare) {
-      const res = await fetch(p.images[0]);
+    const fullSrc = p.images && p.images.length ? await resolveFullImage(p.images[0]) : null;
+    if (fullSrc && navigator.canShare) {
+      const res = await fetch(fullSrc);
       const blob = await res.blob();
       const ext = blob.type.split('/')[1] || 'jpg';
       const file = new File([blob], p.design + '.' + ext, { type: blob.type });
@@ -3888,9 +3978,10 @@ async function shareProduct(id) {
   } catch (e) {
     if (e && e.name === 'AbortError') return; // user cancelled share sheet, do nothing
     // Fallback: download the image and copy details to clipboard
-    if (p.images && p.images.length) {
+    const fullSrc = p.images && p.images.length ? await resolveFullImage(p.images[0]) : null;
+    if (fullSrc) {
       const a = document.createElement('a');
-      a.href = p.images[0];
+      a.href = fullSrc;
       a.download = p.design + '.jpg';
       document.body.appendChild(a); a.click(); a.remove();
     }
@@ -3958,6 +4049,7 @@ function bulkDeleteSelected() {
 }
 function confirmBulkDelete() {
   const ids = new Set(selectedProductIds);
+  DB.products.forEach(p => { if (ids.has(p.id)) deleteProductImages(p); });
   DB.products = DB.products.filter(p => !ids.has(p.id));
   save();
   toast('✓ ' + ids.size + ' item(s) deleted');
@@ -3977,26 +4069,32 @@ async function bulkShareSelected() {
     if (!navigator.canShare) throw new Error('no-share-api');
     const files = [];
     for (const p of products) {
-      const res = await fetch(p.images[0]);
+      const fullSrc = await resolveFullImage(p.images[0]);
+      if (!fullSrc) continue;
+      const res = await fetch(fullSrc);
       const blob = await res.blob();
       const ext = blob.type.split('/')[1] || 'jpg';
       files.push(new File([blob], p.design + '.' + ext, { type: blob.type }));
     }
-    if (!navigator.canShare({ files })) throw new Error('cannot-share-files');
+    if (!files.length || !navigator.canShare({ files })) throw new Error('cannot-share-files');
     await navigator.share({ files });
     toggleSelectMode();
     return;
   } catch (e) {
     if (e && e.name === 'AbortError') return; // user cancelled share sheet
     // Fallback: download each selected image individually (no caption/text involved)
-    products.forEach((p, i) => {
+    let delay = 0;
+    for (const p of products) {
+      const fullSrc = await resolveFullImage(p.images[0]);
+      if (!fullSrc) continue;
       setTimeout(() => {
         const a = document.createElement('a');
-        a.href = p.images[0];
+        a.href = fullSrc;
         a.download = p.design + '.jpg';
         document.body.appendChild(a); a.click(); a.remove();
-      }, i * 300);
-    });
+      }, delay);
+      delay += 300;
+    }
     toast('✓ Downloading ' + products.length + ' image(s)');
     toggleSelectMode();
   }
@@ -4156,32 +4254,73 @@ function openFullImg(src) {
 }
 
 // ===== IMAGE UPLOAD =====
+// The ORIGINAL photo is kept exactly as uploaded — full resolution, no
+// recompression, no quality loss — and is what's used for the detail
+// view, zoom, share, and PDF export. Separately, we generate one small
+// thumbnail per photo purely for the catalogue grid/list, since that's
+// the view that shows many photos on screen at once. Rendering dozens
+// of full-resolution photos simultaneously in a scrolling grid is what
+// was exhausting the tab's memory and causing the crash — the fix is
+// to make THAT view lightweight, not to touch the original photo.
+const THUMB_MAX_DIMENSION = 320;
+const THUMB_JPEG_QUALITY = 0.75;
+
+function makeThumbFromDataUrl(dataUrl, maxDim = THUMB_MAX_DIMENSION, quality = THUMB_JPEG_QUALITY) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { naturalWidth: w, naturalHeight: h } = img;
+      if (w > maxDim || h > maxDim) {
+        if (w >= h) { h = Math.round(h * (maxDim / w)); w = maxDim; }
+        else { w = Math.round(w * (maxDim / h)); h = maxDim; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      try { resolve(canvas.toDataURL('image/jpeg', quality)); }
+      catch (err) { resolve(dataUrl); } // fall back to original if thumbnailing fails
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+// Reads the file as-is (full original quality, unchanged) and also
+// builds a lightweight thumbnail alongside it.
+function compressImageFile(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const full = e.target.result;
+      const thumb = await makeThumbFromDataUrl(full);
+      resolve({ full, thumb });
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
 function handleImgUpload(input) {
   Array.from(input.files).forEach(file => {
-    compressImageFile(file).then(dataUrl => {
-      editingImages.push(dataUrl);
+    compressImageFile(file).then(entry => {
+      if (entry) editingImages.push({ id: null, full: entry.full, thumb: entry.thumb, isNew: true });
       renderImgPreviews();
     });
   });
   input.value = '';
 }
-// Reads the file as-is (no resizing/re-encoding) so the original photo
-// quality is preserved. Note: uncompressed phone photos are typically
-// 3-8MB each, so storage usage will grow much faster than before.
-function compressImageFile(file) {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => resolve(e.target.result);
-    reader.onerror = () => resolve(null);
-    reader.readAsDataURL(file);
-  });
-}
 function renderImgPreviews() {
-  document.getElementById('imgPreview').innerHTML = editingImages.map((src,i) =>
-    `<div class="img-preview-item"><img src="${src}"><button class="img-remove" onclick="removeImg(${i})">✕</button></div>`
+  document.getElementById('imgPreview').innerHTML = editingImages.map((entry,i) =>
+    `<div class="img-preview-item"><img src="${entry.thumb || (isDataUrl(entry.id) ? entry.id : entry.full) || ''}"><button class="img-remove" onclick="removeImg(${i})">✕</button></div>`
   ).join('');
 }
-function removeImg(i) { editingImages.splice(i,1); renderImgPreviews(); }
+function removeImg(i) {
+  const entry = editingImages[i];
+  if (entry && !entry.isNew && entry.id) imagesPendingDeleteOnSave.push(entry.id);
+  editingImages.splice(i,1);
+  renderImgPreviews();
+}
 
 // ===== COLOUR TAGS =====
 function addColorTag() {
@@ -4250,7 +4389,7 @@ function renderProductTags() {
 function removeProductTag(i) { productTags.splice(i,1); renderProductTags(); }
 
 // ===== SAVE PRODUCT =====
-function saveProduct() {
+async function saveProduct() {
   const design = document.getElementById('f_design').value.trim();
   if (!design) { toast('Design No. is required'); return; }
   if (!selectedCategory) { toast('Please select a category'); return; }
@@ -4324,6 +4463,19 @@ function saveProduct() {
     alertAt = parseInt(document.getElementById('f_alert').value) || 5;
   }
 
+  const committedImages = [];
+  const committedThumbs = [];
+  for (const entry of editingImages) {
+    if (entry.isNew) {
+      const id = newImageId();
+      await idbSetImage(id, entry.full);
+      committedImages.push(id);
+    } else {
+      committedImages.push(entry.id);
+    }
+    committedThumbs.push(entry.thumb || null);
+  }
+
   const product = {
     id: editingId || 'p_'+Date.now(),
     design,
@@ -4343,7 +4495,8 @@ function saveProduct() {
     stock,
     alertAt,
     notes: document.getElementById('f_notes').value.trim(),
-    images: [...editingImages]
+    images: committedImages,
+    thumbs: committedThumbs
   };
   if (!editingId) product.createdAt = Date.now();
 
@@ -4353,6 +4506,11 @@ function saveProduct() {
   } else {
     DB.products.push(product);
   }
+
+  // Now that the edit is actually saved, it's safe to delete any photos
+  // the user removed from the form during this edit session.
+  imagesPendingDeleteOnSave.forEach(id => idbDeleteImage(id));
+  imagesPendingDeleteOnSave = [];
 
   save();
   toast(editingId ? '✓ Item updated!' : '✓ Item saved!');
@@ -4365,6 +4523,7 @@ function clearForm() {
   document.getElementById('f_alert').value = 5;
   document.getElementById('f_hidden').checked = false;
   editingImages = []; colorTags = []; productTags = []; editingId = null; selectedCategory = null;
+  imagesPendingDeleteOnSave = []; // discard any pending removals — nothing was actually saved
   renderImgPreviews(); renderColorTags(); renderExistingColorPicker(); renderProductTags(); renderCatSelectGrid();
   document.getElementById('dynamicFieldsSection').style.display = 'none';
   toggleStockFieldsUI();
@@ -4386,7 +4545,7 @@ function editProduct(id) {
       document.getElementById('f_stock').value = p.stock||0;
       document.getElementById('f_alert').value = p.alertAt||5;
     }
-    editingImages = [...(p.images||[])];
+    editingImages = (p.images||[]).map((ref,i) => ({ id: ref, full: null, thumb: (p.thumbs && p.thumbs[i]) || null, isNew: false }));
     colorTags = [...(p.colors||[])];
     productTags = [...(p.tags||[])];
     document.getElementById('f_hidden').checked = !!p.hiddenFromGuests;
@@ -4479,8 +4638,8 @@ function handleBulkImgUpload(id, input) {
   let pending = files.length;
   if (!pending) return;
   files.forEach(file => {
-    compressImageFile(file).then(dataUrl => {
-      if (dataUrl) r.images.push(dataUrl);
+    compressImageFile(file).then(entry => {
+      if (entry) r.images.push({ id: null, full: entry.full, thumb: entry.thumb, isNew: true });
       pending--;
       if (pending === 0) renderBulkTable();
     });
@@ -4622,8 +4781,8 @@ function renderBulkTable() {
       </div>`;
     }
     const imgThumbsHtml = (r.images && r.images.length)
-      ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${r.images.map((src,ii) =>
-          `<div style="position:relative;width:52px;height:52px"><img src="${src}" style="width:100%;height:100%;object-fit:cover;border-radius:6px;border:1px solid var(--border)"><button type="button" onclick="removeBulkImg('${r.id}',${ii})" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:#c0392b;color:#fff;border:none;font-size:11px;line-height:1;cursor:pointer">✕</button></div>`
+      ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${r.images.map((entry,ii) =>
+          `<div style="position:relative;width:52px;height:52px"><img src="${entry.thumb || entry.full || ''}" style="width:100%;height:100%;object-fit:cover;border-radius:6px;border:1px solid var(--border)"><button type="button" onclick="removeBulkImg('${r.id}',${ii})" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:#c0392b;color:#fff;border:none;font-size:11px;line-height:1;cursor:pointer">✕</button></div>`
         ).join('')}</div>`
       : '';
     const bulkImgUploadHtml = `<div class="form-group" style="margin-bottom:9px">
@@ -4650,7 +4809,7 @@ function renderBulkTable() {
   }).join('');
 }
 
-function saveBulkRows() {
+async function saveBulkRows() {
   const catName = document.getElementById('bulk_category').value;
   if (!catName) { toast('Select a category first'); return; }
   const cat = getCategoryDef(catName);
@@ -4665,11 +4824,11 @@ function saveBulkRows() {
   }
 
   let skipped = [];
-  bulkRows.forEach(r => {
-    if (!r.design || !r.design.trim()) return;
+  for (const r of bulkRows) {
+    if (!r.design || !r.design.trim()) continue;
     const designKey = r.design.trim().toLowerCase();
     const clash = DB.products.some(p => (p.design||'').trim().toLowerCase() === designKey);
-    if (clash) { skipped.push(r.design.trim()); return; }
+    if (clash) { skipped.push(r.design.trim()); continue; }
     let price, wholesalePrice, cost, retailPct, wholesalePct, priceMax, stock, alertAt, parts = {};
 
     if (isSet) {
@@ -4708,6 +4867,15 @@ function saveBulkRows() {
       alertAt = 5;
     }
 
+    const committedImages = [];
+    const committedThumbs = [];
+    for (const entry of (r.images||[])) {
+      const id = newImageId();
+      await idbSetImage(id, entry.full);
+      committedImages.push(id);
+      committedThumbs.push(entry.thumb || null);
+    }
+
     DB.products.push({
       id: 'p_'+Date.now()+'_'+Math.floor(Math.random()*100000),
       design: r.design.trim(),
@@ -4718,11 +4886,12 @@ function saveBulkRows() {
       colors: [],
       stock, alertAt,
       notes: '',
-      images: [...(r.images||[])],
+      images: committedImages,
+      thumbs: committedThumbs,
       createdAt: Date.now()
     });
     saved++;
-  });
+  }
 
   if (!saved) {
     toast(skipped.length ? '⚠ All design numbers already in use: ' + skipped.join(', ') : '⚠ Enter at least one Design No.');
@@ -4762,6 +4931,8 @@ function confirmDeleteProduct(id) {
 }
 
 function deleteProduct(id) {
+  const p = DB.products.find(x => x.id === id);
+  if (p) deleteProductImages(p);
   DB.products = DB.products.filter(p => p.id !== id);
   const ok = save();
   closeModal('detailModal');
@@ -4812,8 +4983,9 @@ function renderArchivedList(search = '') {
   }
 
   container.innerHTML = items.map(p => {
-    const thumb = (p.images && p.images[0])
-      ? `<img src="${p.images[0]}" loading="lazy" style="width:52px;height:52px;object-fit:cover;border-radius:8px;flex-shrink:0">`
+    const thumbSrc = (p.thumbs && p.thumbs[0]) || (isDataUrl(p.images && p.images[0]) ? p.images[0] : null);
+    const thumb = thumbSrc
+      ? `<img src="${thumbSrc}" loading="lazy" style="width:52px;height:52px;object-fit:cover;border-radius:8px;flex-shrink:0">`
       : `<div style="width:52px;height:52px;border-radius:8px;background:var(--cream-dark);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🏮</div>`;
     const when = p.archivedAt ? new Date(p.archivedAt).toLocaleDateString('en-IN', {day:'2-digit',month:'short',year:'numeric'}) : '';
     return `<div class="report-row" style="align-items:center">
@@ -5425,7 +5597,7 @@ function importBackup(input) {
         if (!DB.customers) DB.customers = [];
         migrateData();
         save();
-        toast('✓ Backup restored — ' + DB.products.length + ' items loaded');
+        toast('✓ Backup restored — ' + DB.products.length + ' items loaded. If this is a new device, also restore your Photos ZIP so full-quality photos load.');
         renderCatalogue();
       } else {
         toast('⚠ Invalid backup file');
@@ -5435,6 +5607,93 @@ function importBackup(input) {
     }
   };
   reader.readAsText(file);
+  input.value = '';
+}
+
+// ===== PHOTO EXPORT / RESTORE =====
+// The JSON backup above only contains product data, small thumbnails, and
+// short reference ids — not the full-quality photos themselves (with 500+
+// products at full resolution, a single combined JSON file isn't practical).
+// This exports every full-quality photo as its own file inside a ZIP, named
+// after its storage id, so restoring it later just puts each photo straight
+// back where it belongs — no separate mapping file needed.
+async function exportPhotos() {
+  const ids = new Set();
+  let hasLegacy = false;
+  (DB.products||[]).forEach(p => (p.images||[]).forEach(ref => {
+    if (isImageId(ref)) ids.add(ref);
+    else if (isDataUrl(ref)) hasLegacy = true;
+  }));
+  if (!ids.size) {
+    toast(hasLegacy
+      ? '⏳ Photos are still being prepared in the background — please wait a bit and try again'
+      : '⚠ No photos to export');
+    return;
+  }
+  toast('⏳ Preparing ' + ids.size + ' photo(s) for export — this can take a while for a large catalogue…');
+  try { await loadJSZip(); } catch(e) { toast('⚠ Need internet to load ZIP library'); return; }
+
+  const zip = new JSZip();
+  let done = 0, failed = 0;
+  for (const id of ids) {
+    try {
+      const dataUrl = await idbGetImage(id);
+      if (!dataUrl) { failed++; continue; }
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const ext = (blob.type.split('/')[1] || 'jpg').replace('jpeg','jpg');
+      zip.file(id + '.' + ext, blob);
+    } catch(e) { failed++; }
+    done++;
+    if (done % 25 === 0) toast('⏳ Preparing photos… ' + done + '/' + ids.size);
+    await new Promise(r => setTimeout(r, 0));
+  }
+  toast('⏳ Zipping ' + ids.size + ' photo(s)…');
+  let content;
+  try { content = await zip.generateAsync({ type: 'blob' }); }
+  catch(e) { toast('⚠ Could not build the ZIP file — try exporting again'); return; }
+
+  const url = URL.createObjectURL(content);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'pratap-fashion-photos-' + new Date().toISOString().split('T')[0] + '.zip';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  toast('✓ Photos exported (' + (ids.size - failed) + (failed ? ', ' + failed + ' failed' : '') + ')');
+}
+
+function handleImportPhotosClick(input) {
+  requestAccess(() => importPhotos(input));
+}
+async function importPhotos(input) {
+  const file = input.files[0];
+  if (!file) return;
+  toast('⏳ Restoring photos — this can take a while for a large ZIP…');
+  try { await loadJSZip(); } catch(e) { toast('⚠ Need internet to load ZIP library'); input.value = ''; return; }
+  try {
+    const zip = await JSZip.loadAsync(file);
+    const entries = Object.values(zip.files).filter(f => !f.dir);
+    let done = 0;
+    for (const entry of entries) {
+      const key = entry.name.replace(/\.[^.\/]+$/, ''); // strip extension → the original storage id
+      try {
+        const blob = await entry.async('blob');
+        const dataUrl = await new Promise((resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => resolve(r.result);
+          r.onerror = reject;
+          r.readAsDataURL(blob);
+        });
+        await idbSetImage(key, dataUrl);
+      } catch(e) {}
+      done++;
+      if (done % 25 === 0) toast('⏳ Restoring photos… ' + done + '/' + entries.length);
+    }
+    toast('✓ Restored ' + done + ' photo(s)');
+    if (currentView === 'catalogue') renderCatalogue();
+  } catch(e) {
+    toast('⚠ Could not read that file — make sure it\'s a Photos ZIP exported from this app');
+  }
   input.value = '';
 }
 
@@ -5493,10 +5752,129 @@ migrateData(); // reads from IndexedDB (falls back to/migrates old localStorage 
   }
 
   updateStockFilterUI();
+
+  // If there's still legacy data (full photos embedded directly in the
+  // database instead of stored separately), clean that up FIRST — before
+  // rendering the catalogue, which needs its own memory. Doing the cleanup
+  // and the heavy rendering at the same time is what was causing the crash
+  // right at startup for large catalogues; keeping them sequential (and as
+  // lightweight as possible during the cleanup) fixes it for good.
+  if (hasLegacyPhotoBacklog()) {
+    showRepairOverlay();
+    try { await backfillThumbnails({ saveEvery: 1, urgent: true }); }
+    catch (e) { /* whatever got saved before the error is kept — the rest will be retried next launch */ }
+    finally { hideRepairOverlay(); }
+  }
+
   renderCatalogue();
   applyRoleUI();
   checkBackupReminder();
+  backfillThumbnails({ saveEvery: 5 }); // catches any small day-to-day leftovers quietly
 })();
+
+// ===== MIGRATION: THUMBNAILS + MOVE FULL PHOTOS OUT OF THE MAIN DB =====
+// Two related jobs, run together over existing products, one photo at a
+// time:
+//   1. Generate a small thumbnail for any photo that doesn't have one yet
+//      (used only in the catalogue grid/list — keeps browsing lightweight).
+//   2. Move any photo still stored directly inside the product record (as a
+//      full base64 data URL — the old format) out into its own separate
+//      storage slot, leaving only a short reference id behind. This is the
+//      part that actually stops the main database from growing into the
+//      gigabytes as your catalogue grows — the photo itself is never
+//      modified or re-encoded, only *where* it's kept changes.
+//
+// Two modes:
+//   - "background" (saveEvery=5, no overlay): used for small day-to-day
+//     top-ups once the catalogue is already healthy.
+//   - "urgent" (saveEvery=1, blocking, with an overlay, no catalogue
+//     rendering happening at the same time): used once at startup if a
+//     legacy backlog is detected. Saving after every single photo means
+//     even if the tab runs out of memory partway through — which is exactly
+//     the failure mode this is fixing — the NEXT time the app opens there's
+//     strictly less legacy data left to load and process than the time
+//     before. Every attempt makes permanent, un-lost progress, so repeated
+//     opens eventually clear the backlog for good, even on a phone too
+//     memory-constrained to do it all in one sitting.
+let thumbBackfillRunning = false;
+function hasLegacyPhotoBacklog() {
+  return (DB.products || []).some(p => (p.images || []).some(isDataUrl));
+}
+async function backfillThumbnails(opts) {
+  const { saveEvery = 5, urgent = false } = opts || {};
+  if (thumbBackfillRunning) return;
+  thumbBackfillRunning = true;
+  try {
+    const products = (DB.products || []).filter(p =>
+      p.images && p.images.length && (
+        (!p.thumbs || p.thumbs.length !== p.images.length) ||
+        p.images.some(isDataUrl) // still in the old inline format
+      )
+    );
+    if (!products.length) return;
+    let touched = 0;
+    for (const p of products) {
+      const newImages = [];
+      const newThumbs = [];
+      for (let i = 0; i < p.images.length; i++) {
+        const ref = p.images[i];
+        const existingThumb = p.thumbs && p.thumbs[i];
+        if (isDataUrl(ref)) {
+          // Legacy full photo still embedded directly — move it out to its
+          // own storage slot and keep only the id in the product from now on.
+          const id = newImageId();
+          try { await idbSetImage(id, ref); newImages.push(id); }
+          catch (e) { newImages.push(ref); } // if storage write fails, leave as-is rather than losing the photo
+          newThumbs.push(existingThumb || await makeThumbFromDataUrl(ref).catch(() => null));
+        } else {
+          // Already a reference id — just make sure it has a thumbnail.
+          newImages.push(ref);
+          if (existingThumb) {
+            newThumbs.push(existingThumb);
+          } else {
+            const full = await resolveFullImage(ref);
+            newThumbs.push(full ? await makeThumbFromDataUrl(full).catch(() => null) : null);
+          }
+        }
+        // yield back to the browser between each photo so it stays responsive
+        await new Promise(r => setTimeout(r, 0));
+      }
+      p.images = newImages;
+      p.thumbs = newThumbs;
+      touched++;
+      if (touched % saveEvery === 0) {
+        save();
+        if (urgent) showRepairOverlay('Optimizing your data… ' + touched + ' / ' + products.length + ' products cleaned up');
+        else if (currentView === 'catalogue') renderCatalogue();
+      }
+    }
+    save();
+    if (currentView === 'catalogue') renderCatalogue();
+  } finally {
+    thumbBackfillRunning = false;
+  }
+}
+
+// Minimal full-screen progress overlay used only during the urgent startup
+// repair, before the rest of the app (with its heavier catalogue rendering)
+// has started — keeping memory use as low as possible while the cleanup runs.
+function showRepairOverlay(msg) {
+  let el = document.getElementById('repairOverlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'repairOverlay';
+    el.style.cssText = 'position:fixed;inset:0;background:#fdf6ec;z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;font-family:inherit';
+    el.innerHTML = '<div style="font-size:40px;margin-bottom:16px">🏮</div>' +
+      '<div id="repairOverlayMsg" style="font-size:16px;color:#5a2a27;font-weight:700;margin-bottom:10px">Optimizing your data…</div>' +
+      '<div style="font-size:13px;color:#8a6a60;max-width:320px">This is a one-time cleanup that only needs to run once. Please keep this screen open — you can close and reopen the app anytime and it will pick up where it left off.</div>';
+    document.body.appendChild(el);
+  }
+  if (msg) document.getElementById('repairOverlayMsg').textContent = msg;
+}
+function hideRepairOverlay() {
+  const el = document.getElementById('repairOverlay');
+  if (el) el.remove();
+}
 
 // ===== PWA: INSTALL PROMPT + SERVICE WORKER =====
 let deferredInstallPrompt = null;
